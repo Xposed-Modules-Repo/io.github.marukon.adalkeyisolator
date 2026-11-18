@@ -1,9 +1,9 @@
-# AdalKeyIsolator
+# OfficeAdalKeyIsolator
 
-面向微软 Office Android 系列应用（`sharedUserId="com.microsoft.office"`）的 **LibXposed API 102** 模块：在不修改原版 APK 签名与不触发 Google Play 校验失败的前提下，为每个同 UID 组件隔离各自的 `AndroidKeyStore` `"AdalKey"` 主密钥别名，解决 `Word`、`Excel`、`PowerPoint`、`OneNote`、`Microsoft 365 (Copilot)` 之间互相覆盖凭证密钥导致的“偶尔首开掉登录 / 需要修复账户 / `Failed to decrypt with key:AdalKey`”问题。
+专为微软 Office Android 系列应用（`sharedUserId="com.microsoft.office"`）设计的 **LibXposed API 102** 模块：在不修改原版 APK 签名与不破坏 Google Play 自动更新的前提下，为每个同 UID 组件隔离各自的 `AndroidKeyStore` `"AdalKey"` 主密钥别名，解决 `Word`、`Excel`、`PowerPoint`、`OneNote`、`Microsoft 365 (Copilot)` 之间互相覆盖凭证密钥导致的“偶尔首开掉登录 / 需要修复账户 / `Failed to decrypt with key:AdalKey`”问题。
 
-- **仓库地址**: https://github.com/Marukon/AdalKeyIsolator
-- **包名**: `io.github.marukon.adalkeyisolator`
+- **仓库地址**: https://github.com/Marukon/OfficeAdalKeyIsolator
+- **应用名称**: `OfficeAdalKeyIsolator`（包名 `io.github.marukon.adalkeyisolator`）
 - **最低系统要求**: Android 13+（API 33+），LSPosed 1.9.3+（LibXposed API 102）
 
 ---
@@ -16,23 +16,26 @@
 
 ---
 
-## 实现原理
+## 实现原理与自检能力
 
-[MainHook.kt](app/src/main/java/io/github/marukon/adalkeyisolator/MainHook.kt) 采用双层幂等拦截策略，仅当目标密钥别名为精确字符串 `"AdalKey"` 时，将其按当前进程包名重写为 **`"AdalKey_<packageName>"`**（例如 `AdalKey_com.microsoft.office.word`）：
+### 1. 双层幂等隔离 Hook（[MainHook.kt](app/src/main/java/io/github/marukon/adalkeyisolator/MainHook.kt)）
+仅当目标密钥别名为精确字符串 `"AdalKey"` 时，将其按当前进程包名重写为 **`"AdalKey_<packageName>"`**（例如 `AdalKey_com.microsoft.office.word`）：
 
-1. **MSAL / OneAuth Provider 入口层**：
-   - `KeyStoreBackedSecretKeyProviderFactory.create(String, String, Context)`
-   - `KeyStoreBackedSecretKeyProvider` 构造函数
-   - `AndroidWrappedKeyProvider` 构造函数
-2. **AndroidKeyStore 系统接口层（覆盖内联常量的 `StorageHelper` 及各类调用方）**：
-   - `java.security.KeyStore` 涉及别名的 12 类方法（仅限 `KeyStore.type` 为 `"AndroidKeyStore"` 时改写：`containsAlias`、`deleteEntry`、`getEntry`、`setEntry`、`getKey`、`setKeyEntry`、`getCertificate`、`getCertificateChain`、`setCertificateEntry`、`isKeyEntry`、`isCertificateEntry`、`getCreationDate`）
-   - `android.security.keystore.KeyGenParameterSpec$Builder` 构造函数
-   - `android.security.KeyPairGeneratorSpec$Builder.setAlias`
+- **MSAL / OneAuth Provider 入口层**：
+  - `KeyStoreBackedSecretKeyProviderFactory.create(String, String, Context)`
+  - `KeyStoreBackedSecretKeyProvider` 构造函数
+  - `AndroidWrappedKeyProvider` 构造函数
+- **AndroidKeyStore 系统接口层（覆盖内联常量的 `StorageHelper` 及各类调用方）**：
+  - `java.security.KeyStore` 涉及别名的 12 类方法（仅限 `KeyStore.type` 为 `"AndroidKeyStore"` 时改写：`containsAlias`、`deleteEntry`、`getEntry`、`setEntry`、`getKey`、`setKeyEntry`、`getCertificate`、`getCertificateChain`、`setCertificateEntry`、`isKeyEntry`、`isCertificateEntry`、`getCreationDate`）
+  - `android.security.keystore.KeyGenParameterSpec$Builder` 构造函数
+  - `android.security.KeyPairGeneratorSpec$Builder.setAlias`
 
-### 优势
+### 2. 三重可用性及升级兼容自检（[MainActivity.kt](app/src/main/java/io/github/marukon/adalkeyisolator/MainActivity.kt) & [StatusProvider.kt](app/src/main/java/io/github/marukon/adalkeyisolator/StatusProvider.kt)）
+为避免后续微软更新 Office 后改名或重构内部类而难以察觉，模块界面内置三重校验（无需 Root）：
 
-- 完整保留原版 APK 官方签名与 `TokenSharingService` 签名校验互通能力。
-- 支持 Google Play 正常自动更新，无需重打包、无需卸载重装或迁移数据目录。
+1. **LSPosed 作用域与运行状态**：通过 `XposedService.getScope()` 与 `XposedService.getRunningTargets()` 实时显示各 Office 组件是否已勾选作用域以及当前运行中进程的注入状态（支持一键发起 `requestScope` 申请）。
+2. **安装包静态兼容检查**：利用目标应用的 `ClassLoader` 实时扫描 `KeyStoreBackedSecretKeyProviderFactory.create`、`KeyStoreBackedSecretKeyProvider`、`AndroidWrappedKeyProvider`、`StorageHelper` 是否仍匹配当前已安装版本（版本升级后若有类或签名变动会直接提示缺失项）。
+3. **进程内真实 Hook 回执**：已注入的目标 Office 进程在初始化与实际触发别名重写时，通过受调用方 UID 校验的 `StatusProvider` 回传 `KeyStore` Hook 数量、MSAL Hook 数量、累计重写次数及当前生效版本号，支持一键向运行中进程发送探测广播实时刷新回执。
 
 ---
 
@@ -52,10 +55,10 @@
 
 ## 使用步骤
 
-1. 构建或下载 Release APK 并安装。
-2. 在 **LSPosed 管理器**中启用 `AdalKeyIsolator`，确认推荐作用域中的 Office 应用均已勾选（无需重启手机）。
+1. 构建或下载 Release APK 并安装（模块默认不显示桌面图标，仅通过 LSPosed 模块界面打开）。
+2. 在 **LSPosed 管理器**中启用 `OfficeAdalKeyIsolator`，确认推荐作用域中的 Office 应用均已勾选（无需重启手机）。
 3. **强行停止**已开启作用域的 Office 应用各一次。
-4. 首次重新打开各应用时，会因为切换到全新的隔离别名而自动重新生成各自独立的 `AdalKey_<包名>` 与 `adalks` 文件，并从本地个人账户或 `TokenSharingService`（如 OneDrive / Edge / Outlook）完成一次初始化同步；此后各组件之间密钥完全独立，互不覆盖。
+4. 重新打开各 Office 应用后，从 LSPosed 打开 `OfficeAdalKeyIsolator` 模块界面，即可确认 `作用域`、`代码兼容检查 (4/4)` 与 `进程内 Hook 回执` 全部正常。
 
 ---
 

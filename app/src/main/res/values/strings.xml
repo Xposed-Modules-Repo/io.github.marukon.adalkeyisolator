@@ -1,11 +1,12 @@
 <resources>
-    <string name="app_name">AdalKeyIsolator</string>
+    <string name="app_name">OfficeAdalKeyIsolator</string>
     <string name="xposed_description">Isolate Microsoft Office sharedUserId AndroidKeyStore AdalKey alias per package name.</string>
     <string name="status_checking">正在检查 LSPosed 服务连接状态...</string>
-    <string name="status_connected">LSPosed 服务已连接 (API %1$d)，当前作用域已启用 %2$d 个应用</string>
-    <string name="status_disconnected">未连接 LSPosed 服务：请在 LSPosed 中启用本模块并勾选下方目标 Office 应用后重启对应应用</string>
-    <string name="usage_note">原理：在不改变 APK 签名和 sharedUserId 的前提下，把各自传入 AndroidKeyStore / MSAL / ADAL 的硬编码别名 AdalKey 自动重写为 AdalKey_&lt;包名&gt;，防止同 UID 应用互相覆盖删除主密钥。</string>
-    <string name="targets_title">推荐作用域及隔离密钥别名</string>
-    <string name="item_target_installed">• %1$s (%2$s)\n  UID: %3$d → 密钥别名: %4$s</string>
+    <string name="status_connected">LSPosed 服务已连接 (API %1$d)，推荐目标已勾选 %2$d / %3$d</string>
+    <string name="status_disconnected">未连接 LSPosed 服务：请在 LSPosed 中启用本模块并勾选目标 Office 应用后重启对应应用</string>
+    <string name="usage_note">除检测 LSPosed 连接外，本页还会实时扫描已安装 Office APK 的目标类签名（预判新版是否改名失效），并接收运行中 Office 进程发回的真实 Hook 挂载与重写回执。</string>
+    <string name="targets_title">Office 目标自检与 Hook 状态</string>
+    <string name="btn_refresh">刷新状态 / 探测运行中进程</string>
+    <string name="btn_request_scope">勾选缺失作用域</string>
     <string name="item_target_missing">• %1$s (%2$s) — 未安装</string>
 </resources>

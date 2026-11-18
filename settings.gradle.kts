@@ -25,5 +25,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "AdalKeyIsolator"
+rootProject.name = "OfficeAdalKeyIsolator"
 include(":app")
