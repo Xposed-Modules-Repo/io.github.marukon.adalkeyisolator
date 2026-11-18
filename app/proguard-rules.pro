@@ -1,0 +1,6 @@
+-dontwarn io.github.libxposed.annotation.**
+-adaptresourcefilecontents META-INF/xposed/java_init.list
+-keep class io.github.marukon.adalkeyisolator.MainHook {
+    <init>();
+    *;
+}
