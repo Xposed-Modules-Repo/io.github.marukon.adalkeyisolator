@@ -1,0 +1,1 @@
+微软 Office Android 套件（sharedUserId="com.microsoft.office"）AndroidKeyStore AdalKey 密钥别名按包名隔离模块，解决多端登录凭证互相覆盖与解密失败，内置兼容检测与进程实测回执（基于 LibXposed API 102，无桌面图标）。
