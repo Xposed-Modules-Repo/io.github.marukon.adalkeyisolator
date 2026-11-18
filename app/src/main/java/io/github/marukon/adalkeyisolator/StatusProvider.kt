@@ -23,25 +23,7 @@ class StatusProvider : ContentProvider() {
             if (arg !in pkgs || arg !in TARGET_PACKAGE_SET) return null
         }
 
-        val prefs = ctx.getSharedPreferences(PREF_HOOK_STATUS, Context.MODE_PRIVATE)
-        val prevRewrites = prefs.getInt("${arg}_rewrite_count", 0)
-        val newRewrites = extras.getInt(KEY_REWRITE_COUNT, 0)
-        val bootCount = extras.getInt(KEY_BOOT_HOOK_COUNT, 0)
-        val msalCount = extras.getInt(KEY_MSAL_HOOK_COUNT, 0)
-        val processName = extras.getString(KEY_PROCESS_NAME).orEmpty()
-        val versionName = extras.getString(KEY_VERSION_NAME).orEmpty()
-        val error = extras.getString(KEY_ERROR).orEmpty()
-
-        prefs.edit()
-            .putInt("${arg}_boot_hooks", bootCount)
-            .putInt("${arg}_msal_hooks", msalCount)
-            .putInt("${arg}_rewrite_count", maxOf(prevRewrites, newRewrites))
-            .putString("${arg}_process", processName)
-            .putString("${arg}_version", versionName)
-            .putString("${arg}_error", error)
-            .putLong("${arg}_updated_at", System.currentTimeMillis())
-            .apply()
-
+        saveReport(ctx, arg, extras)
         return Bundle().apply { putBoolean("ok", true) }
     }
 
@@ -73,6 +55,7 @@ class StatusProvider : ContentProvider() {
         const val KEY_REWRITE_COUNT = "rewrite_count"
         const val KEY_PROCESS_NAME = "process_name"
         const val KEY_VERSION_NAME = "version_name"
+        const val KEY_HOOK_DETAILS = "hook_details"
         const val KEY_ERROR = "error"
 
         val TARGET_PACKAGE_SET = setOf(
@@ -82,5 +65,35 @@ class StatusProvider : ContentProvider() {
             "com.microsoft.office.onenote",
             "com.microsoft.office.officehubrow",
         )
+
+        fun saveReport(ctx: Context, pkg: String, extras: Bundle) {
+            val prefs = ctx.getSharedPreferences(PREF_HOOK_STATUS, Context.MODE_PRIVATE)
+            val prevVersion = prefs.getString("${pkg}_version", "").orEmpty()
+            val prevRewrites = prefs.getInt("${pkg}_rewrite_count", 0)
+            val newRewrites = extras.getInt(KEY_REWRITE_COUNT, 0)
+            val bootCount = extras.getInt(KEY_BOOT_HOOK_COUNT, 0)
+            val msalCount = extras.getInt(KEY_MSAL_HOOK_COUNT, 0)
+            val processName = extras.getString(KEY_PROCESS_NAME).orEmpty()
+            val versionName = extras.getString(KEY_VERSION_NAME).orEmpty()
+            val hookDetails = extras.getString(KEY_HOOK_DETAILS).orEmpty()
+            val error = extras.getString(KEY_ERROR).orEmpty()
+
+            val effectiveRewrites = if (prevVersion.isNotEmpty() && versionName.isNotEmpty() && prevVersion != versionName) {
+                newRewrites
+            } else {
+                maxOf(prevRewrites, newRewrites)
+            }
+
+            prefs.edit()
+                .putInt("${pkg}_boot_hooks", bootCount)
+                .putInt("${pkg}_msal_hooks", msalCount)
+                .putInt("${pkg}_rewrite_count", effectiveRewrites)
+                .putString("${pkg}_process", processName)
+                .putString("${pkg}_version", versionName)
+                .putString("${pkg}_hook_details", hookDetails)
+                .putString("${pkg}_error", error)
+                .putLong("${pkg}_updated_at", System.currentTimeMillis())
+                .apply()
+        }
     }
 }

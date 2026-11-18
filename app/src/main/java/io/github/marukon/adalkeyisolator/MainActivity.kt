@@ -1,16 +1,25 @@
 package io.github.marukon.adalkeyisolator
 
+import android.content.BroadcastReceiver
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.LayoutInflater
+import android.view.View
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
+import androidx.annotation.ColorRes
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.google.android.material.button.MaterialButton
+import com.google.android.material.card.MaterialCardView
 import io.github.libxposed.service.HookedTarget
 import io.github.libxposed.service.XposedService
 import io.github.libxposed.service.XposedServiceHelper
@@ -21,10 +30,17 @@ import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
 
+    private lateinit var tvVersionBadge: TextView
     private lateinit var tvStatus: TextView
-    private lateinit var llTargetList: LinearLayout
+    private lateinit var tvHookSummary: TextView
     private lateinit var btnRefresh: MaterialButton
     private lateinit var btnRequestScope: MaterialButton
+    private lateinit var llInstalledList: LinearLayout
+    private lateinit var tvNoInstalled: TextView
+    private lateinit var cardUninstalled: MaterialCardView
+    private lateinit var tvUninstalledHeader: TextView
+    private lateinit var tvUninstalledChevron: TextView
+    private lateinit var tvUninstalledBody: TextView
 
     private val executor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -33,6 +49,8 @@ class MainActivity : AppCompatActivity() {
     private var xposedService: XposedService? = null
 
     private var compatCache: Map<String, CompatCheckResult> = emptyMap()
+    private val expandedPackages = mutableSetOf<String>()
+    private var uninstalledExpanded = false
 
     data class CompatCheckResult(
         val installed: Boolean,
@@ -40,26 +58,50 @@ class MainActivity : AppCompatActivity() {
         val versionName: String = "",
         val matchedItems: Int = 0,
         val totalItems: Int = 4,
+        val variantLabel: String = "",
         val missingDetails: List<String> = emptyList()
     )
+
+    private enum class HealthState {
+        FULL_SUCCESS,
+        READY,
+        WARN,
+        ERROR,
+        DISCONNECTED
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        tvVersionBadge = findViewById(R.id.tvVersionBadge)
         tvStatus = findViewById(R.id.tvStatus)
-        llTargetList = findViewById(R.id.llTargetList)
+        tvHookSummary = findViewById(R.id.tvHookSummary)
         btnRefresh = findViewById(R.id.btnRefresh)
         btnRequestScope = findViewById(R.id.btnRequestScope)
+        llInstalledList = findViewById(R.id.llInstalledList)
+        tvNoInstalled = findViewById(R.id.tvNoInstalled)
+        cardUninstalled = findViewById(R.id.cardUninstalled)
+        tvUninstalledHeader = findViewById(R.id.tvUninstalledHeader)
+        tvUninstalledChevron = findViewById(R.id.tvUninstalledChevron)
+        tvUninstalledBody = findViewById(R.id.tvUninstalledBody)
+
+        tvVersionBadge.text = "v${BuildConfig.VERSION_NAME}"
+        tintPill(tvVersionBadge, R.color.status_idle_bg, R.color.status_idle_fg)
 
         btnRefresh.setOnClickListener { refreshAll(pingRunning = true) }
         btnRequestScope.setOnClickListener { requestMissingScopes() }
+        cardUninstalled.setOnClickListener {
+            uninstalledExpanded = !uninstalledExpanded
+            tvUninstalledBody.visibility = if (uninstalledExpanded) View.VISIBLE else View.GONE
+            tvUninstalledChevron.text = if (uninstalledExpanded) "▴" else "▾"
+        }
 
         XposedServiceHelper.registerListener(object : XposedServiceHelper.OnServiceListener {
             override fun onServiceBind(service: XposedService) {
                 xposedService = service
                 runOnUiThread {
-                    updateLspStatus(service)
+                    updateHeaderStatus(service)
                     refreshAll(pingRunning = true)
                 }
             }
@@ -86,42 +128,67 @@ class MainActivity : AppCompatActivity() {
         executor.shutdownNow()
     }
 
-    private fun updateLspStatus(service: XposedService) {
+    private fun installedTargetPackages(): List<Pair<String, String>> =
+        TARGET_PACKAGES.filter { (pkg, _) -> compatCache[pkg]?.installed == true }
+
+    private fun updateHeaderStatus(service: XposedService) {
         val scope = runCatching { service.scope }.getOrDefault(emptyList())
-        val enabledTargets = TARGET_PACKAGES.count { (pkg, _) -> pkg in scope }
-        tvStatus.text = getString(
-            R.string.status_connected,
-            service.apiVersion,
-            enabledTargets,
-            TARGET_PACKAGES.size
-        )
-        tvStatus.setTextColor(
-            ContextCompat.getColor(this, android.R.color.holo_green_dark)
-        )
-        val hasMissing = TARGET_PACKAGES.any { (pkg, _) ->
-            compatCache[pkg]?.installed == true && pkg !in scope
+        val installed = installedTargetPackages()
+        val enabledInstalled = installed.count { (pkg, _) -> pkg in scope }
+
+        if (compatCache.isEmpty()) {
+            tvStatus.text = getString(R.string.status_checking)
+            tvStatus.setTextColor(ContextCompat.getColor(this, R.color.text_secondary))
+            btnRequestScope.isEnabled = false
+            return
         }
+
+        if (installed.isEmpty()) {
+            tvStatus.text = getString(R.string.status_connected_none, service.apiVersion)
+            tvStatus.setTextColor(ContextCompat.getColor(this, R.color.status_ready_fg))
+            btnRequestScope.text = getString(R.string.btn_request_scope)
+            btnRequestScope.isEnabled = false
+            return
+        }
+
+        tvStatus.text = getString(
+            R.string.status_connected_installed,
+            service.apiVersion,
+            enabledInstalled,
+            installed.size
+        )
+        val hasMissing = enabledInstalled < installed.size
+        tvStatus.setTextColor(
+            ContextCompat.getColor(
+                this,
+                if (hasMissing) R.color.status_warn_fg else R.color.status_ok_fg
+            )
+        )
+        btnRequestScope.text = getString(
+            if (hasMissing) R.string.btn_request_scope else R.string.btn_scope_all_done
+        )
         btnRequestScope.isEnabled = hasMissing
     }
 
     private fun showDisconnected() {
         tvStatus.text = getString(R.string.status_disconnected)
-        tvStatus.setTextColor(ContextCompat.getColor(this, android.R.color.holo_orange_dark))
+        tvStatus.setTextColor(ContextCompat.getColor(this, R.color.status_warn_fg))
+        btnRequestScope.text = getString(R.string.btn_request_scope)
         btnRequestScope.isEnabled = false
     }
 
     private fun requestMissingScopes() {
         val service = xposedService ?: return
         val scope = runCatching { service.scope }.getOrDefault(emptyList())
-        val missing = TARGET_PACKAGES
+        val missing = installedTargetPackages()
             .map { it.first }
-            .filter { pkg -> compatCache[pkg]?.installed == true && pkg !in scope }
+            .filter { pkg -> pkg !in scope }
         if (missing.isEmpty()) return
 
         service.requestScope(missing, object : XposedService.OnScopeEventListener {
             override fun onScopeRequestApproved(approved: MutableList<String>) {
                 runOnUiThread {
-                    updateLspStatus(service)
+                    updateHeaderStatus(service)
                     renderCards()
                 }
             }
@@ -133,15 +200,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshAll(pingRunning: Boolean) {
-        if (pingRunning) {
-            for ((pkg, _) in TARGET_PACKAGES) {
-                runCatching {
-                    val intent = Intent(MainHook.ACTION_PING).setPackage(pkg)
-                    sendBroadcast(intent)
-                }
-            }
-        }
-
         executor.execute {
             val results = LinkedHashMap<String, CompatCheckResult>()
             for ((pkg, _) in TARGET_PACKAGES) {
@@ -149,13 +207,40 @@ class MainActivity : AppCompatActivity() {
             }
             compatCache = results
             mainHandler.post {
-                xposedService?.let { updateLspStatus(it) }
+                val service = xposedService
+                if (service != null) updateHeaderStatus(service) else showDisconnected()
+                if (pingRunning) {
+                    pingInstalledTargets(results)
+                }
                 renderCards()
             }
-            if (pingRunning) {
-                mainHandler.postDelayed({
-                    if (!isDestroyed) renderCards()
-                }, 400L)
+        }
+    }
+
+    private fun pingInstalledTargets(results: Map<String, CompatCheckResult>) {
+        for ((pkg, compat) in results) {
+            if (!compat.installed) continue
+            runCatching {
+                val intent = Intent(MainHook.ACTION_PING).setPackage(pkg)
+                sendOrderedBroadcast(
+                    intent,
+                    null,
+                    object : BroadcastReceiver() {
+                        override fun onReceive(context: Context?, intent: Intent?) {
+                            if (resultCode == RESULT_OK) {
+                                val extras = getResultExtras(false)
+                                if (extras != null) {
+                                    StatusProvider.saveReport(this@MainActivity, pkg, extras)
+                                    renderCards()
+                                }
+                            }
+                        }
+                    },
+                    mainHandler,
+                    0,
+                    null,
+                    null
+                )
             }
         }
     }
@@ -175,9 +260,6 @@ class MainActivity : AppCompatActivity() {
         }
         val versionName = pkgInfo?.versionName.orEmpty()
 
-        val missing = mutableListOf<String>()
-        var matched = 0
-
         val targetCtx = runCatching {
             createPackageContext(
                 pkg,
@@ -185,39 +267,62 @@ class MainActivity : AppCompatActivity() {
             )
         }.getOrNull()
 
-        val cl = targetCtx?.classLoader
-        if (cl == null) {
-            return CompatCheckResult(
-                installed = true,
-                uid = appInfo.uid,
-                versionName = versionName,
-                matchedItems = 0,
-                totalItems = 4,
-                missingDetails = listOf("无法加载目标 ClassLoader")
-            )
-        }
+        val cl = targetCtx?.classLoader ?: return CompatCheckResult(
+            installed = true,
+            uid = appInfo.uid,
+            versionName = versionName,
+            matchedItems = 0,
+            totalItems = 4,
+            missingDetails = listOf("无法加载目标 ClassLoader (createPackageContext 返回空)")
+        )
 
-        val factoryOk = runCatching {
+        val missing = mutableListOf<String>()
+        var matched = 0
+        var usedR8Fallback = false
+
+        val hasFactory = runCatching {
             val cls = cl.loadClass("com.microsoft.identity.common.crypto.KeyStoreBackedSecretKeyProviderFactory")
             cls.getDeclaredMethod("create", String::class.java, String::class.java, Context::class.java)
             true
         }.getOrDefault(false)
-        if (factoryOk) matched++ else missing.add("KeyStoreBackedSecretKeyProviderFactory.create")
+        val hasEncManager = runCatching {
+            cl.loadClass("com.microsoft.identity.common.crypto.AndroidAuthSdkStorageEncryptionManager")
+            true
+        }.getOrDefault(false)
+        if (hasFactory || hasEncManager) {
+            matched++
+            if (!hasFactory) usedR8Fallback = true
+        } else {
+            missing.add("KeyStoreBackedSecretKeyProviderFactory.create / AndroidAuthSdkStorageEncryptionManager")
+        }
 
-        val providerOk = runCatching {
-            val cls = cl.loadClass("com.microsoft.identity.common.crypto.KeyStoreBackedSecretKeyProvider")
-            cls.declaredConstructors.any { c ->
-                val p = c.parameterTypes
-                p.size >= 2 && p[0] == Context::class.java && p[1] == String::class.java
+        val providerCheck = inspectProviderClass(
+            cl = cl,
+            className = "com.microsoft.identity.common.crypto.KeyStoreBackedSecretKeyProvider",
+            ctorMatcher = { types -> types.size >= 2 && types[0] == Context::class.java && types[1] == String::class.java }
+        )
+        when (providerCheck) {
+            ProviderMatch.CTOR -> matched++
+            ProviderMatch.GET_ALIAS -> {
+                matched++
+                usedR8Fallback = true
             }
-        }.getOrDefault(false)
-        if (providerOk) matched++ else missing.add("KeyStoreBackedSecretKeyProvider")
+            ProviderMatch.MISSING -> missing.add("KeyStoreBackedSecretKeyProvider (ctor / getAlias)")
+        }
 
-        val wrappedOk = runCatching {
-            val cls = cl.loadClass("com.microsoft.identity.common.crypto.AndroidWrappedKeyProvider")
-            cls.declaredConstructors.any { c -> c.parameterTypes.firstOrNull() == String::class.java }
-        }.getOrDefault(false)
-        if (wrappedOk) matched++ else missing.add("AndroidWrappedKeyProvider")
+        val wrappedCheck = inspectProviderClass(
+            cl = cl,
+            className = "com.microsoft.identity.common.crypto.AndroidWrappedKeyProvider",
+            ctorMatcher = { types -> types.firstOrNull() == String::class.java }
+        )
+        when (wrappedCheck) {
+            ProviderMatch.CTOR -> matched++
+            ProviderMatch.GET_ALIAS -> {
+                matched++
+                usedR8Fallback = true
+            }
+            ProviderMatch.MISSING -> missing.add("AndroidWrappedKeyProvider (ctor / getAlias)")
+        }
 
         val storageHelperOk = runCatching {
             cl.loadClass("com.microsoft.aad.adal.StorageHelper")
@@ -225,18 +330,43 @@ class MainActivity : AppCompatActivity() {
         }.getOrDefault(false)
         if (storageHelperOk) matched++ else missing.add("StorageHelper")
 
+        val variantLabel = when {
+            matched < 4 -> "兼容检测不完整 ($matched/4)"
+            usedR8Fallback -> "R8 精简签名 (getAlias + KeyStore)"
+            else -> "标准 MSAL 签名 (Factory + Ctor + getAlias)"
+        }
+
         return CompatCheckResult(
             installed = true,
             uid = appInfo.uid,
             versionName = versionName,
             matchedItems = matched,
             totalItems = 4,
+            variantLabel = variantLabel,
             missingDetails = missing
         )
     }
 
+    private enum class ProviderMatch { CTOR, GET_ALIAS, MISSING }
+
+    private fun inspectProviderClass(
+        cl: ClassLoader,
+        className: String,
+        ctorMatcher: (Array<Class<*>>) -> Boolean
+    ): ProviderMatch {
+        val cls = runCatching { cl.loadClass(className) }.getOrNull() ?: return ProviderMatch.MISSING
+        if (cls.declaredConstructors.any { ctorMatcher(it.parameterTypes) }) {
+            return ProviderMatch.CTOR
+        }
+        val hasGetAlias = runCatching {
+            val m = cls.getDeclaredMethod("getAlias")
+            m.returnType == String::class.java
+        }.getOrDefault(false)
+        return if (hasGetAlias) ProviderMatch.GET_ALIAS else ProviderMatch.MISSING
+    }
+
     private fun renderCards() {
-        llTargetList.removeAllViews()
+        llInstalledList.removeAllViews()
         val service = xposedService
         val scope = runCatching { service?.scope }.getOrNull().orEmpty()
         val runningTargets: List<HookedTarget> = runCatching {
@@ -244,71 +374,248 @@ class MainActivity : AppCompatActivity() {
         }.getOrNull().orEmpty()
         val statusPrefs = getSharedPreferences(StatusProvider.PREF_HOOK_STATUS, Context.MODE_PRIVATE)
         val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
-        val padV = (8 * resources.displayMetrics.density).toInt()
+        val inflater = LayoutInflater.from(this)
 
-        for ((pkg, label) in TARGET_PACKAGES) {
-            val compat = compatCache[pkg]
-            val tv = TextView(this).apply {
-                textSize = 13.5f
-                setPadding(0, padV, 0, padV)
+        val installedList = mutableListOf<Pair<String, String>>()
+        val uninstalledList = mutableListOf<Pair<String, String>>()
+        for (entry in TARGET_PACKAGES) {
+            if (compatCache[entry.first]?.installed == true) {
+                installedList.add(entry)
+            } else {
+                uninstalledList.add(entry)
             }
+        }
 
-            if (compat == null || !compat.installed) {
-                tv.text = getString(R.string.item_target_missing, label, pkg)
-                llTargetList.addView(tv)
-                continue
-            }
+        var fullSuccessCount = 0
+        var totalRewrites = 0
 
-            val inScope = if (service == null) "未知 (LSPosed 未连接)" else if (pkg in scope) "✓ 已勾选" else "✗ 未勾选"
+        for ((pkg, label) in installedList) {
+            val compat = compatCache[pkg] ?: continue
+            val inScope = service != null && pkg in scope
             val procTargets = runningTargets.filter {
                 it.processName == pkg || it.processName.startsWith("$pkg:")
             }
-            val runningLine = if (service == null) {
-                "未知"
-            } else if (procTargets.isNotEmpty()) {
-                val pids = procTargets.joinToString(", ") { "${it.pid}(${it.state.name})" }
-                "✓ 已注入运行中 [PID: $pids]"
-            } else {
-                "○ 当前未运行（冷启动时按作用域注入）"
-            }
-
-            val compatLine = if (compat.matchedItems == compat.totalItems) {
-                "✓ 4/4 类签名完整兼容"
-            } else {
-                "⚠ ${compat.matchedItems}/${compat.totalItems} 部分缺失: ${compat.missingDetails.joinToString(", ")}"
-            }
 
             val updatedAt = statusPrefs.getLong("${pkg}_updated_at", 0L)
-            val receiptLine = if (updatedAt > 0L) {
-                val bootHooks = statusPrefs.getInt("${pkg}_boot_hooks", 0)
-                val msalHooks = statusPrefs.getInt("${pkg}_msal_hooks", 0)
-                val rewrites = statusPrefs.getInt("${pkg}_rewrite_count", 0)
-                val err = statusPrefs.getString("${pkg}_error", "").orEmpty()
-                val reportedVer = statusPrefs.getString("${pkg}_version", "").orEmpty()
-                val timeStr = timeFmt.format(Date(updatedAt))
-                val verMismatch = reportedVer.isNotEmpty() && compat.versionName.isNotEmpty() && reportedVer != compat.versionName
-                if (err.isNotEmpty()) {
-                    "✗ Hook 报错 ($timeStr): $err"
-                } else if (verMismatch) {
-                    "⚠ 上次回执属于旧版本 $reportedVer（当前 ${compat.versionName}），请重启该应用刷新"
-                } else {
-                    "✓ 实测成功 ($timeStr): KeyStore $bootHooks 处 + MSAL $msalHooks 处 | 已拦截改写 $rewrites 次"
+            val hasReceipt = updatedAt > 0L
+            val bootHooks = statusPrefs.getInt("${pkg}_boot_hooks", 0)
+            val msalHooks = statusPrefs.getInt("${pkg}_msal_hooks", 0)
+            val rewrites = statusPrefs.getInt("${pkg}_rewrite_count", 0)
+            val reportedVer = statusPrefs.getString("${pkg}_version", "").orEmpty()
+            val hookDetails = statusPrefs.getString("${pkg}_hook_details", "").orEmpty()
+            val err = statusPrefs.getString("${pkg}_error", "").orEmpty()
+            val verMismatch = hasReceipt && reportedVer.isNotEmpty() && compat.versionName.isNotEmpty() && reportedVer != compat.versionName
+            if (hasReceipt && !verMismatch) totalRewrites += rewrites
+
+            val receiptOk = hasReceipt && err.isEmpty() && !verMismatch && bootHooks > 0 && msalHooks > 0
+            val compatOk = compat.matchedItems == compat.totalItems
+
+            val (state, badgeText, summarySub) = when {
+                service == null -> Triple(
+                    HealthState.DISCONNECTED,
+                    "未连接 LSP",
+                    "v${compat.versionName.ifEmpty { "?" }} · 请在 LSPosed 中启用模块"
+                )
+                err.isNotEmpty() -> Triple(
+                    HealthState.ERROR,
+                    "✗ Hook 报错",
+                    "v${compat.versionName} · 点击展开并复制错误信息"
+                )
+                !inScope -> Triple(
+                    HealthState.WARN,
+                    "✗ 未勾选作用域",
+                    "v${compat.versionName} · 点击顶部「勾选缺失作用域」"
+                )
+                !compatOk -> Triple(
+                    HealthState.ERROR,
+                    "⚠ 兼容 ${compat.matchedItems}/${compat.totalItems}",
+                    "v${compat.versionName} · 部分签名缺失，点击复制诊断"
+                )
+                verMismatch -> Triple(
+                    HealthState.WARN,
+                    "⚠ 需重启刷新",
+                    "v${compat.versionName} · 回执属于旧版 $reportedVer"
+                )
+                procTargets.isNotEmpty() && receiptOk -> {
+                    fullSuccessCount++
+                    val pidStr = procTargets.joinToString(",") { it.pid.toString() }
+                    Triple(
+                        HealthState.FULL_SUCCESS,
+                        "✓ Hook 成功",
+                        "v${compat.versionName} · PID $pidStr · 已改写 $rewrites 次"
+                    )
+                }
+                procTargets.isNotEmpty() && hasReceipt && bootHooks > 0 && msalHooks == 0 -> Triple(
+                    HealthState.WARN,
+                    "● 仅底层生效",
+                    "v${compat.versionName} · KeyStore $bootHooks 处 (MSAL 0 处)"
+                )
+                procTargets.isNotEmpty() -> Triple(
+                    HealthState.READY,
+                    "○ 待回执",
+                    "v${compat.versionName} · 已注入 PID ${procTargets.first().pid}，点刷新探测"
+                )
+                receiptOk -> {
+                    fullSuccessCount++
+                    Triple(
+                        HealthState.READY,
+                        "✓ 已验证就绪",
+                        "v${compat.versionName} · 未运行 (上次改写 $rewrites 次)"
+                    )
+                }
+                else -> Triple(
+                    HealthState.READY,
+                    "○ 已勾选就绪",
+                    "v${compat.versionName} · 打开一次 $label 即可验证"
+                )
+            }
+
+            val card = inflater.inflate(R.layout.item_target_card, llInstalledList, false) as MaterialCardView
+            val vDot = card.findViewById<View>(R.id.vDot)
+            val tvAppName = card.findViewById<TextView>(R.id.tvAppName)
+            val tvBadge = card.findViewById<TextView>(R.id.tvBadge)
+            val tvChevron = card.findViewById<TextView>(R.id.tvChevron)
+            val tvSummarySub = card.findViewById<TextView>(R.id.tvSummarySub)
+            val llDetails = card.findViewById<LinearLayout>(R.id.llDetails)
+            val tvDetailMeta = card.findViewById<TextView>(R.id.tvDetailMeta)
+            val llErrorBox = card.findViewById<LinearLayout>(R.id.llErrorBox)
+            val tvErrorTitle = card.findViewById<TextView>(R.id.tvErrorTitle)
+            val tvErrorCopyHint = card.findViewById<TextView>(R.id.tvErrorCopyHint)
+            val tvErrorText = card.findViewById<TextView>(R.id.tvErrorText)
+            val tvCopyReport = card.findViewById<TextView>(R.id.tvCopyReport)
+
+            tvAppName.text = label
+            tvBadge.text = badgeText
+            tvSummarySub.text = summarySub
+
+            val (bgRes, fgRes) = when (state) {
+                HealthState.FULL_SUCCESS -> R.color.status_ok_bg to R.color.status_ok_fg
+                HealthState.READY -> R.color.status_ready_bg to R.color.status_ready_fg
+                HealthState.WARN -> R.color.status_warn_bg to R.color.status_warn_fg
+                HealthState.ERROR -> R.color.status_err_bg to R.color.status_err_fg
+                HealthState.DISCONNECTED -> R.color.status_idle_bg to R.color.status_idle_fg
+            }
+            tintPill(tvBadge, bgRes, fgRes)
+            vDot.backgroundTintList = ColorStateList.valueOf(ContextCompat.getColor(this, fgRes))
+
+            val scopeText = if (service == null) "未知 (LSPosed 未连接)" else if (inScope) "✓ 已勾选" else "✗ 未勾选"
+            val procText = when {
+                service == null -> "未知"
+                procTargets.isNotEmpty() -> "✓ 已注入运行中 [" + procTargets.joinToString(", ") { "${it.pid} (${it.state.name})" } + "]"
+                else -> "○ 当前未运行（冷启动按作用域注入）"
+            }
+            val compatText = if (compatOk) {
+                "✓ 4/4 类签名完整兼容 · ${compat.variantLabel}"
+            } else {
+                "⚠ ${compat.matchedItems}/${compat.totalItems} 部分缺失"
+            }
+            val receiptText = if (hasReceipt) {
+                val t = timeFmt.format(Date(updatedAt))
+                val detailSuffix = if (hookDetails.isNotEmpty()) "\n挂载详情: $hookDetails" else ""
+                when {
+                    err.isNotEmpty() -> "✗ Hook 报错 ($t)$detailSuffix"
+                    verMismatch -> "⚠ 上次回执属于旧版本 $reportedVer ($t)，请重启应用"
+                    else -> "✓ 实测成功 ($t): KeyStore $bootHooks 处 + MSAL $msalHooks 处 | 改写 $rewrites 次$detailSuffix"
                 }
             } else {
                 "○ 尚无进程回执（启用作用域后打开一次 $label 即可生成）"
             }
 
-            tv.text = buildString {
-                append("• $label ($pkg)\n")
-                append("  版本: ${compat.versionName.ifEmpty { "unknown" }} | UID: ${compat.uid}\n")
-                append("  隔离别名: AdalKey_$pkg\n")
-                append("  作用域: $inScope\n")
-                append("  LSPosed 状态: $runningLine\n")
-                append("  代码兼容检查: $compatLine\n")
-                append("  进程内 Hook 回执: $receiptLine")
+            val detailText = buildString {
+                append("包名: $pkg (UID ${compat.uid})\n")
+                append("版本: ${compat.versionName.ifEmpty { "unknown" }}\n")
+                append("隔离别名: AdalKey_$pkg\n")
+                append("作用域: $scopeText\n")
+                append("进程状态: $procText\n")
+                append("代码兼容: $compatText\n")
+                append("进程回执: $receiptText")
             }
-            llTargetList.addView(tv)
+            tvDetailMeta.text = detailText
+
+            val errorReasons = buildList {
+                if (err.isNotEmpty()) add("Hook 报错: $err")
+                if (!compatOk) add("缺失签名 (${compat.matchedItems}/${compat.totalItems}): ${compat.missingDetails.joinToString(", ")}")
+                if (verMismatch) add("版本不一致: 回执为 $reportedVer，当前已安装 ${compat.versionName}")
+            }
+
+            if (errorReasons.isNotEmpty()) {
+                val errBody = errorReasons.joinToString("\n")
+                val fullErrorCopy = "$label ($pkg v${compat.versionName})\n$errBody"
+                llErrorBox.visibility = View.VISIBLE
+                val errBg = if (err.isNotEmpty() || !compatOk) R.color.status_err_bg else R.color.status_warn_bg
+                val errFg = if (err.isNotEmpty() || !compatOk) R.color.status_err_fg else R.color.status_warn_fg
+                llErrorBox.backgroundTintList = ColorStateList.valueOf(ContextCompat.getColor(this, errBg))
+                tvErrorTitle.setTextColor(ContextCompat.getColor(this, errFg))
+                tvErrorCopyHint.setTextColor(ContextCompat.getColor(this, errFg))
+                tvErrorText.setTextColor(ContextCompat.getColor(this, errFg))
+                tvErrorText.text = errBody
+                llErrorBox.setOnClickListener {
+                    copyToClipboard("OfficeAdalKeyIsolator Error", fullErrorCopy, R.string.toast_error_copied)
+                }
+            } else {
+                llErrorBox.visibility = View.GONE
+            }
+
+            val fullReportCopy = buildString {
+                append("=== $label ===\n")
+                append(detailText)
+                if (errorReasons.isNotEmpty()) {
+                    append("\n异常详情:\n")
+                    append(errorReasons.joinToString("\n"))
+                }
+            }
+            tvCopyReport.setOnClickListener {
+                copyToClipboard("OfficeAdalKeyIsolator Report", fullReportCopy, R.string.toast_report_copied)
+            }
+
+            val applyExpanded = { expanded: Boolean ->
+                llDetails.visibility = if (expanded) View.VISIBLE else View.GONE
+                tvChevron.text = if (expanded) "▴" else "▾"
+            }
+            applyExpanded(pkg in expandedPackages)
+
+            card.setOnClickListener {
+                val nowExpanded = if (pkg in expandedPackages) {
+                    expandedPackages.remove(pkg)
+                    false
+                } else {
+                    expandedPackages.add(pkg)
+                    true
+                }
+                applyExpanded(nowExpanded)
+            }
+
+            llInstalledList.addView(card)
         }
+
+        if (installedList.isEmpty()) {
+            tvNoInstalled.visibility = View.VISIBLE
+            tvHookSummary.text = "当前设备未检测到 Office 目标应用"
+        } else {
+            tvNoInstalled.visibility = View.GONE
+            tvHookSummary.text = "已安装 ${installedList.size} 个应用 · 已通过验证 $fullSuccessCount / ${installedList.size} · 累计改写 $totalRewrites 次"
+        }
+
+        if (uninstalledList.isNotEmpty()) {
+            cardUninstalled.visibility = View.VISIBLE
+            tvUninstalledHeader.text = "未安装的 Office 目标 (${uninstalledList.size})"
+            tvUninstalledBody.text = uninstalledList.joinToString("\n") { (pkg, label) -> "• $label ($pkg)" }
+            tvUninstalledBody.visibility = if (uninstalledExpanded) View.VISIBLE else View.GONE
+            tvUninstalledChevron.text = if (uninstalledExpanded) "▴" else "▾"
+        } else {
+            cardUninstalled.visibility = View.GONE
+        }
+    }
+
+    private fun tintPill(view: TextView, @ColorRes bgRes: Int, @ColorRes fgRes: Int) {
+        view.backgroundTintList = ColorStateList.valueOf(ContextCompat.getColor(this, bgRes))
+        view.setTextColor(ContextCompat.getColor(this, fgRes))
+    }
+
+    private fun copyToClipboard(label: String, text: String, toastResId: Int) {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText(label, text))
+        Toast.makeText(this, toastResId, Toast.LENGTH_SHORT).show()
     }
 
     companion object {

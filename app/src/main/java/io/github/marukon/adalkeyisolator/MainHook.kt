@@ -1,5 +1,6 @@
 package io.github.marukon.adalkeyisolator
 
+import android.app.Activity
 import android.app.Application
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -15,6 +16,7 @@ import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
 import java.security.KeyStore
 import java.util.Collections
 import java.util.IdentityHashMap
+import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -24,6 +26,7 @@ class MainHook : XposedModule() {
     private val appHooked = AtomicBoolean(false)
     private val firstRewriteLogged = AtomicBoolean(false)
     private val hookedClassLoaders = Collections.newSetFromMap(IdentityHashMap<ClassLoader, Boolean>())
+    private val msalHookLabels = CopyOnWriteArraySet<String>()
 
     private val bootHookCount = AtomicInteger(0)
     private val msalHookCount = AtomicInteger(0)
@@ -34,6 +37,9 @@ class MainHook : XposedModule() {
 
     @Volatile
     private var targetPackage: String? = null
+
+    @Volatile
+    private var cachedVersionName: String = ""
 
     @Volatile
     private var lastError: String? = null
@@ -58,6 +64,14 @@ class MainHook : XposedModule() {
         hookMicrosoftProviders(activePkg, isolatedAlias, param.classLoader)
     }
 
+    private fun onAliasRewritten(isolatedAlias: String) {
+        rewriteCount.incrementAndGet()
+        if (firstRewriteLogged.compareAndSet(false, true)) {
+            logBoth(Log.INFO, "Rewriting alias '$ADAL_KEY_ALIAS' -> '$isolatedAlias'")
+            reportStatusAsync(targetPackage)
+        }
+    }
+
     private fun proceedWithReplacedAlias(
         chain: XposedInterface.Chain,
         argIndex: Int,
@@ -72,11 +86,7 @@ class MainHook : XposedModule() {
         }
         val raw = chain.getArg(argIndex) as? String
         if (raw == ADAL_KEY_ALIAS) {
-            rewriteCount.incrementAndGet()
-            if (firstRewriteLogged.compareAndSet(false, true)) {
-                logBoth(Log.INFO, "Rewriting alias '$ADAL_KEY_ALIAS' -> '$isolatedAlias'")
-                reportStatusAsync(targetPackage)
-            }
+            onAliasRewritten(isolatedAlias)
             val newArgs = chain.args.toTypedArray()
             newArgs[argIndex] = isolatedAlias
             return chain.proceed(newArgs)
@@ -91,7 +101,14 @@ class MainHook : XposedModule() {
                 val result = chain.proceed()
                 val app = chain.thisObject as? Application
                 if (app != null && appContext == null) {
-                    appContext = app.applicationContext ?: app
+                    val ctx = app.applicationContext ?: app
+                    appContext = ctx
+                    cachedVersionName = runCatching {
+                        ctx.packageManager.getPackageInfo(
+                            pkg,
+                            PackageManager.PackageInfoFlags.of(0L)
+                        ).versionName.orEmpty()
+                    }.getOrDefault("")
                     registerPingReceiver(app, pkg)
                     reportStatusAsync(pkg)
                 }
@@ -107,37 +124,53 @@ class MainHook : XposedModule() {
         runCatching {
             val receiver = object : BroadcastReceiver() {
                 override fun onReceive(context: Context?, intent: Intent?) {
+                    setResult(Activity.RESULT_OK, pkg, buildStatusBundle(pkg))
                     reportStatusAsync(pkg)
                 }
             }
             app.registerReceiver(receiver, IntentFilter(ACTION_PING), Context.RECEIVER_EXPORTED)
+        }.onFailure {
+            recordError("Ping receiver failed: ${it.message}", it)
+        }
+    }
+
+    private fun buildStatusBundle(pkgName: String): Bundle {
+        val ctx = appContext
+        if (cachedVersionName.isEmpty() && ctx != null) {
+            cachedVersionName = runCatching {
+                ctx.packageManager.getPackageInfo(
+                    pkgName,
+                    PackageManager.PackageInfoFlags.of(0L)
+                ).versionName.orEmpty()
+            }.getOrDefault("")
+        }
+        val msalSummary = if (msalHookLabels.isEmpty()) {
+            "none"
+        } else {
+            msalHookLabels.sorted().joinToString(", ")
+        }
+        return Bundle().apply {
+            putInt(StatusProvider.KEY_BOOT_HOOK_COUNT, bootHookCount.get())
+            putInt(StatusProvider.KEY_MSAL_HOOK_COUNT, msalHookCount.get())
+            putInt(StatusProvider.KEY_REWRITE_COUNT, rewriteCount.get())
+            putString(StatusProvider.KEY_PROCESS_NAME, Application.getProcessName())
+            putString(StatusProvider.KEY_VERSION_NAME, cachedVersionName)
+            putString(StatusProvider.KEY_HOOK_DETAILS, "KeyStore=${bootHookCount.get()} | MSAL=[$msalSummary]")
+            putString(StatusProvider.KEY_ERROR, lastError.orEmpty())
         }
     }
 
     private fun reportStatusAsync(pkg: String?) {
         val ctx = appContext ?: return
         val pkgName = pkg ?: return
+        if (Application.getProcessName() != pkgName) return
         Thread({
             runCatching {
-                val verName = runCatching {
-                    ctx.packageManager.getPackageInfo(
-                        pkgName,
-                        PackageManager.PackageInfoFlags.of(0L)
-                    ).versionName.orEmpty()
-                }.getOrDefault("")
-                val bundle = Bundle().apply {
-                    putInt(StatusProvider.KEY_BOOT_HOOK_COUNT, bootHookCount.get())
-                    putInt(StatusProvider.KEY_MSAL_HOOK_COUNT, msalHookCount.get())
-                    putInt(StatusProvider.KEY_REWRITE_COUNT, rewriteCount.get())
-                    putString(StatusProvider.KEY_PROCESS_NAME, Application.getProcessName())
-                    putString(StatusProvider.KEY_VERSION_NAME, verName)
-                    putString(StatusProvider.KEY_ERROR, lastError.orEmpty())
-                }
                 ctx.contentResolver.call(
                     Uri.parse("content://${StatusProvider.AUTHORITY}"),
                     StatusProvider.METHOD_REPORT,
                     pkgName,
-                    bundle
+                    buildStatusBundle(pkgName)
                 )
             }
         }, "AdalKeyStatusReporter").apply {
@@ -197,6 +230,26 @@ class MainHook : XposedModule() {
         }
     }
 
+    private fun hookGetAliasMethod(
+        cls: Class<*>,
+        isolatedAlias: String,
+        label: String
+    ): Int {
+        val method = runCatching { cls.getDeclaredMethod("getAlias") }.getOrNull() ?: return 0
+        if (method.returnType != String::class.java) return 0
+        hook(method).intercept { chain ->
+            val res = chain.proceed()
+            if (res == ADAL_KEY_ALIAS) {
+                onAliasRewritten(isolatedAlias)
+                isolatedAlias
+            } else {
+                res
+            }
+        }
+        msalHookLabels.add("$label.getAlias")
+        return 1
+    }
+
     private fun hookMicrosoftProviders(pkg: String, isolatedAlias: String, classLoader: ClassLoader) {
         synchronized(hookedClassLoaders) {
             if (!hookedClassLoaders.add(classLoader)) return
@@ -215,6 +268,7 @@ class MainHook : XposedModule() {
             hook(createMethod).intercept { chain ->
                 proceedWithReplacedAlias(chain, 0, isolatedAlias)
             }
+            msalHookLabels.add("Factory.create")
             count++
         }
 
@@ -227,8 +281,10 @@ class MainHook : XposedModule() {
                 hook(ctor).intercept { chain ->
                     proceedWithReplacedAlias(chain, 1, isolatedAlias)
                 }
+                msalHookLabels.add("KeyStoreProvider(ctor)")
                 count++
             }
+            count += hookGetAliasMethod(providerClass, isolatedAlias, "KeyStoreProvider")
         }
 
         runCatching {
@@ -239,8 +295,10 @@ class MainHook : XposedModule() {
                 hook(ctor).intercept { chain ->
                     proceedWithReplacedAlias(chain, 0, isolatedAlias)
                 }
+                msalHookLabels.add("WrappedProvider(ctor)")
                 count++
             }
+            count += hookGetAliasMethod(wrappedClass, isolatedAlias, "WrappedProvider")
         }
 
         if (count > 0) {

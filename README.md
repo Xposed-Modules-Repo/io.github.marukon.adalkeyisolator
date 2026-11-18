@@ -21,10 +21,10 @@
 ### 1. 双层幂等隔离 Hook（[MainHook.kt](app/src/main/java/io/github/marukon/adalkeyisolator/MainHook.kt)）
 仅当目标密钥别名为精确字符串 `"AdalKey"` 时，将其按当前进程包名重写为 **`"AdalKey_<packageName>"`**（例如 `AdalKey_com.microsoft.office.word`）：
 
-- **MSAL / OneAuth Provider 入口层**：
-  - `KeyStoreBackedSecretKeyProviderFactory.create(String, String, Context)`
-  - `KeyStoreBackedSecretKeyProvider` 构造函数
-  - `AndroidWrappedKeyProvider` 构造函数
+- **MSAL / OneAuth Provider 入口层（兼顾标准签名与 Copilot R8 精简签名）**：
+  - `KeyStoreBackedSecretKeyProviderFactory.create(String, String, Context)`（若存在）及 `AndroidAuthSdkStorageEncryptionManager`
+  - `KeyStoreBackedSecretKeyProvider` 构造函数及 `getAlias()`
+  - `AndroidWrappedKeyProvider` 构造函数及 `getAlias()`
 - **AndroidKeyStore 系统接口层（覆盖内联常量的 `StorageHelper` 及各类调用方）**：
   - `java.security.KeyStore` 涉及别名的 12 类方法（仅限 `KeyStore.type` 为 `"AndroidKeyStore"` 时改写：`containsAlias`、`deleteEntry`、`getEntry`、`setEntry`、`getKey`、`setKeyEntry`、`getCertificate`、`getCertificateChain`、`setCertificateEntry`、`isKeyEntry`、`isCertificateEntry`、`getCreationDate`）
   - `android.security.keystore.KeyGenParameterSpec$Builder` 构造函数
@@ -33,9 +33,9 @@
 ### 2. 三重可用性及升级兼容自检（[MainActivity.kt](app/src/main/java/io/github/marukon/adalkeyisolator/MainActivity.kt) & [StatusProvider.kt](app/src/main/java/io/github/marukon/adalkeyisolator/StatusProvider.kt)）
 为避免后续微软更新 Office 后改名或重构内部类而难以察觉，模块界面内置三重校验（无需 Root）：
 
-1. **LSPosed 作用域与运行状态**：通过 `XposedService.getScope()` 与 `XposedService.getRunningTargets()` 实时显示各 Office 组件是否已勾选作用域以及当前运行中进程的注入状态（支持一键发起 `requestScope` 申请）。
-2. **安装包静态兼容检查**：利用目标应用的 `ClassLoader` 实时扫描 `KeyStoreBackedSecretKeyProviderFactory.create`、`KeyStoreBackedSecretKeyProvider`、`AndroidWrappedKeyProvider`、`StorageHelper` 是否仍匹配当前已安装版本（版本升级后若有类或签名变动会直接提示缺失项）。
-3. **进程内真实 Hook 回执**：已注入的目标 Office 进程在初始化与实际触发别名重写时，通过受调用方 UID 校验的 `StatusProvider` 回传 `KeyStore` Hook 数量、MSAL Hook 数量、累计重写次数及当前生效版本号，支持一键向运行中进程发送探测广播实时刷新回执。
+1. **按已安装应用计算的作用域状态**：通过 `XposedService.getScope()` 与 `XposedService.getRunningTargets()` 仅针对设备上**已安装**的 Office 应用统计作用域勾选比例与进程注入状态，支持一键发起 `requestScope` 申请缺失作用域；未安装应用折叠收纳于底部。
+2. **多变体静态兼容检查**：利用目标应用的 `ClassLoader` 扫描 4 组关键入口（同时兼容标准 MSAL 与 R8 内联后的 `getAlias()` 变体），升级后若有签名变动可直接定位缺失项。
+3. **跨进程有序广播实测回执**：模块页通过 `sendOrderedBroadcast` 直接探测运行中的 Office 进程（绕开目标应用缺少 `<queries>` 对模块 `ContentProvider` 的包可见性限制），同步取回 `KeyStore` / MSAL Hook 挂载数与实际改写次数。列表卡片默认简洁显示“Hook 成功”等状态，点击卡片展开完整详情，异常或兼容缺失块支持点击一键复制诊断信息。
 
 ---
 
@@ -69,4 +69,4 @@ export ANDROID_HOME=/path/to/android-sdk
 ./gradlew assembleRelease --no-daemon
 ```
 
-输出文件路径：`app/build/outputs/apk/release/app-release.apk`。仓库内已配置 GitHub Actions 工作流（`.github/workflows/build.yml`），可通过 Secrets（`SIGNING_KEYSTORE_BASE64`、`SIGNING_STORE_PASSWORD`、`SIGNING_KEY_ALIAS`、`SIGNING_KEY_PASSWORD`）注入签名密钥，仓库本身不包含任何 `.jks` / `.keystore` 文件。
+输出文件路径：`app/build/outputs/apk/release/app-release.apk`。仓库内已配置 GitHub Actions 工作流（`.github/workflows/ci.yml` 与 `.github/workflows/release.yml`），可通过 Repository Secrets（`KEYSTORE_BASE64`、`KEYSTORE_PASSWORD`、`KEY_ALIAS`、`KEY_PASSWORD`、`LSP_REPO_TOKEN`）注入签名密钥与同步凭证，仓库本身不包含任何 `.jks` / `.keystore` 文件。
